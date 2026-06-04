@@ -1,0 +1,478 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "metadata": {
+    "description": "Sentinel 使用量・コストレポート（オフライン HTML）を定期生成し Blob に保存する Logic App。数値は KQL（決定論）、③示唆文のみ Security Copilot Build Agent が生成。"
+  },
+  "parameters": {
+    "logicAppName": {
+      "type": "string",
+      "defaultValue": "la-sentinel-usage-report",
+      "metadata": { "description": "Logic App の名前" }
+    },
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "sentinelSubscriptionId": {
+      "type": "string",
+      "metadata": { "description": "Sentinel ワークスペースが属するサブスクリプション ID。デプロイ環境に合わせて指定（必須）。" }
+    },
+    "sentinelResourceGroupName": {
+      "type": "string",
+      "metadata": { "description": "Sentinel ワークスペースが属するリソースグループ名。デプロイ環境に合わせて指定（必須）。" }
+    },
+    "sentinelWorkspaceName": {
+      "type": "string",
+      "metadata": { "description": "対象の Log Analytics（Sentinel）ワークスペース名。デプロイ環境に合わせて指定（必須）。" }
+    },
+    "sentinelRegionLabel": {
+      "type": "string",
+      "defaultValue": "Japan East",
+      "metadata": { "description": "レポート表示用のワークスペース リージョン ラベル" }
+    },
+    "recurrenceFrequency": {
+      "type": "string",
+      "defaultValue": "Month",
+      "allowedValues": ["Day", "Week", "Month"],
+      "metadata": { "description": "レポート生成頻度" }
+    },
+    "recurrenceInterval": {
+      "type": "int",
+      "defaultValue": 1,
+      "metadata": { "description": "生成間隔（頻度単位あたり）" }
+    },
+    "recurrenceTimeZone": {
+      "type": "string",
+      "defaultValue": "Tokyo Standard Time",
+      "metadata": { "description": "トリガーのタイムゾーン（Windows タイムゾーン名）。例: 'Tokyo Standard Time'、'UTC'" }
+    },
+    "recurrenceMonthDay": {
+      "type": "int",
+      "defaultValue": 1,
+      "minValue": -1,
+      "maxValue": 28,
+      "metadata": { "description": "Month 頻度のとき実行する日。1=毎月1日、-1=月末。Day/Week 頻度では無視される。Month で月末を確実にしたい場合は -1 を指定（28以降は月により欠落するため）" }
+    },
+    "recurrenceHour": {
+      "type": "int",
+      "defaultValue": 9,
+      "minValue": 0,
+      "maxValue": 23,
+      "metadata": { "description": "実行する時（recurrenceTimeZone 基準、0-23）。既定 9 時" }
+    },
+    "recurrenceMinute": {
+      "type": "int",
+      "defaultValue": 0,
+      "minValue": 0,
+      "maxValue": 59,
+      "metadata": { "description": "実行する分（0-59）。既定 0 分" }
+    },
+    "showCost": {
+      "type": "int",
+      "defaultValue": 1,
+      "allowedValues": [0, 1],
+      "metadata": { "description": "0=金額非表示（GBのみ） / 1=金額表示。金額は既定で USD 表示。usdToJpyRate に 1 以上を設定すると JPY 換算表示になる。既定単価は Japan East 定価。Discount がある場合は単価を差し替える。" }
+    },
+    "priceAnalyticsIngestPerGB": {
+      "type": "string",
+      "defaultValue": "6.24",
+      "metadata": { "description": "Analytics tier インジェスト単価 USD/GB。既定は Japan East の Pay-as-you-go 定価（$6.24/GB, Azure Retail Prices API）。Discount 後の実単価があれば上書き。" }
+    },
+    "priceLakeIngestPerGB": {
+      "type": "string",
+      "defaultValue": "0.2175",
+      "metadata": { "description": "Data Lake Only 取込単価 USD/GB。Data Lake への取込は Data lake ingestion と Data processing が必ず両方課金されるため、その合算を既定とする。Japan East 定価 = $0.0725（ingestion）+ $0.145（processing）= $0.2175/GB（Azure Retail Prices API）。Discount 後の実単価があれば上書き。" }
+    },
+    "usdToJpyRate": {
+      "type": "int",
+      "defaultValue": 158,
+      "metadata": { "description": "オプション。ドル円為替レート（例: 150 = 1 USD = 150 円）。1 以上の値を設定するとレポート内の金額をすべて USD から JPY に換算して表示する。既定は 158（円）。0 を指定すると換算せず USD 表示のままとする。" }
+    },
+    "lookbackDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "metadata": { "description": "直近期間の日数（前期比は直前の同日数と比較）" }
+    },
+    "watchlistAlias": {
+      "type": "string",
+      "defaultValue": "TableTiers",
+      "metadata": { "description": "Data Lake Only テーブルを登録した Watchlist のエイリアス" }
+    },
+    "reportStorageAccountName": {
+      "type": "string",
+      "metadata": { "description": "レポート HTML を保存するストレージアカウント名（本テンプレで新規作成。3-24文字英小数字、グローバル一意）" }
+    },
+    "storageSkuName": {
+      "type": "string",
+      "defaultValue": "Standard_LRS",
+      "allowedValues": ["Standard_LRS", "Standard_ZRS", "Standard_GRS"],
+      "metadata": { "description": "作成するストレージアカウントの SKU" }
+    },
+    "reportContainerName": {
+      "type": "string",
+      "defaultValue": "usage-reports",
+      "metadata": { "description": "レポート保存先 Blob コンテナ名" }
+    },
+    "templateContainerName": {
+      "type": "string",
+      "defaultValue": "templates",
+      "metadata": { "description": "HTML テンプレートを置く Blob コンテナ名" }
+    },
+    "templateBlobName": {
+      "type": "string",
+      "defaultValue": "template.html",
+      "metadata": { "description": "テンプレート HTML の Blob 名（デプロイ後にこのコンテナへアップロードする）" }
+    },
+    "outputLanguage": {
+      "type": "string",
+      "defaultValue": "Japanese",
+      "allowedValues": ["English", "Japanese"]
+    }
+  },
+  "variables": {
+    "azuremonitorlogsConnectionName": "azuremonitorlogs",
+    "securitycopilotConnectionName": "securitycopilot",
+    "azureblobConnectionName": "azureblob",
+    "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
+    "usageQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet usageRaw = Usage\n| where TimeGenerated > ago(look*2)\n| where IsBillable == true\n| extend period = iff(TimeGenerated > ago(look), \"cur\", \"prev\")\n| summarize GB = sum(Quantity)/1000 by DataType, period\n| evaluate pivot(period, sum(GB));\nlet seen = Usage | where TimeGenerated > ago(look*2) | summarize lastSeen = max(TimeGenerated) by DataType;\nusageRaw\n| join kind=leftouter seen on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| extend curGB = coalesce(cur, 0.0), prevGB = coalesce(prev, 0.0)\n| extend deltaPercent = iff(prevGB > 0, round((curGB - prevGB)/prevGB*100, 0), 9999.0)\n| project tableName = DataType, tier, currentGB = round(curGB, 3), previousGB = round(prevGB, 3), deltaPercent, lastSeen = format_datetime(lastSeen, \"yyyy-MM-dd\")\n| sort by currentGB desc')]",
+    "summaryQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet cur = Usage | where TimeGenerated > ago(look) | where IsBillable == true | summarize GB = sum(Quantity)/1000 by DataType;\nlet prev = Usage | where TimeGenerated between (ago(look*2) .. ago(look)) | where IsBillable == true | summarize pGB = sum(Quantity)/1000 by DataType;\ncur\n| join kind=leftouter prev on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| summarize analyticsGB = round(sumif(GB, tier == \"Analytics\"), 2), analyticsPrevGB = round(sumif(pGB, tier == \"Analytics\"), 2), lakeGB = round(sumif(GB, tier == \"LakeOnly\"), 3), lakePrevGB = round(sumif(pGB, tier == \"LakeOnly\"), 3), totalTables = dcount(DataType), lakeOnlyCount = dcountif(DataType, tier == \"LakeOnly\")\n| extend analyticsDelta = round(iff(analyticsPrevGB > 0, (analyticsGB - analyticsPrevGB)/analyticsPrevGB*100, 9999.0), 1), lakeDelta = round(iff(lakePrevGB > 0, (lakeGB - lakePrevGB)/lakePrevGB*100, 9999.0), 1)')]"
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Storage/storageAccounts",
+      "apiVersion": "2023-05-01",
+      "name": "[parameters('reportStorageAccountName')]",
+      "location": "[parameters('location')]",
+      "sku": { "name": "[parameters('storageSkuName')]" },
+      "kind": "StorageV2",
+      "properties": {
+        "minimumTlsVersion": "TLS1_2",
+        "allowBlobPublicAccess": false,
+        "supportsHttpsTrafficOnly": true,
+        "allowSharedKeyAccess": false,
+        "networkAcls": { "defaultAction": "Allow", "bypass": "AzureServices" }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('reportStorageAccountName'), '/default/', parameters('reportContainerName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('reportStorageAccountName'))]"
+      ],
+      "properties": { "publicAccess": "None" }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/blobServices/containers",
+      "apiVersion": "2023-05-01",
+      "name": "[concat(parameters('reportStorageAccountName'), '/default/', parameters('templateContainerName'))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('reportStorageAccountName'))]"
+      ],
+      "properties": { "publicAccess": "None" }
+    },
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('azuremonitorlogsConnectionName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "displayName": "Azure Monitor Logs - Sentinel KQL",
+        "api": {
+          "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'azuremonitorlogs')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('securitycopilotConnectionName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "displayName": "Security Copilot",
+        "api": {
+          "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'securitycopilot')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/connections",
+      "apiVersion": "2016-06-01",
+      "name": "[variables('azureblobConnectionName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('reportStorageAccountName'))]"
+      ],
+      "properties": {
+        "displayName": "Azure Blob - Report Storage (Managed Identity)",
+        "parameterValueSet": {
+          "name": "managedIdentityAuth",
+          "values": {}
+        },
+        "api": {
+          "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'azureblob')]"
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Logic/workflows",
+      "apiVersion": "2019-05-01",
+      "name": "[parameters('logicAppName')]",
+      "location": "[parameters('location')]",
+      "identity": { "type": "SystemAssigned" },
+      "tags": {
+        "purpose": "Sentinel-UsageCostReport",
+        "trigger": "schedule"
+      },
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/connections', variables('azuremonitorlogsConnectionName'))]",
+        "[resourceId('Microsoft.Web/connections', variables('securitycopilotConnectionName'))]",
+        "[resourceId('Microsoft.Web/connections', variables('azureblobConnectionName'))]"
+      ],
+      "properties": {
+        "state": "Enabled",
+        "definition": {
+          "$schema": "https://schema.management.azure.com/providers/Microsoft.Logic/schemas/2016-06-01/workflowdefinition.json#",
+          "contentVersion": "1.0.0.0",
+          "parameters": {
+            "$connections": { "defaultValue": {}, "type": "Object" },
+            "sentinelSubscriptionId": { "defaultValue": "[parameters('sentinelSubscriptionId')]", "type": "String" },
+            "sentinelResourceGroupName": { "defaultValue": "[parameters('sentinelResourceGroupName')]", "type": "String" },
+            "sentinelWorkspaceName": { "defaultValue": "[parameters('sentinelWorkspaceName')]", "type": "String" },
+            "sentinelRegionLabel": { "defaultValue": "[parameters('sentinelRegionLabel')]", "type": "String" },
+            "showCost": { "defaultValue": "[parameters('showCost')]", "type": "Int" },
+            "priceAnalyticsIngestPerGB": { "defaultValue": "[parameters('priceAnalyticsIngestPerGB')]", "type": "String" },
+            "priceLakeIngestPerGB": { "defaultValue": "[parameters('priceLakeIngestPerGB')]", "type": "String" },
+            "usdToJpyRate": { "defaultValue": "[parameters('usdToJpyRate')]", "type": "Int" },
+            "lookbackDays": { "defaultValue": "[parameters('lookbackDays')]", "type": "Int" },
+            "reportContainerName": { "defaultValue": "[parameters('reportContainerName')]", "type": "String" },
+            "templateContainerName": { "defaultValue": "[parameters('templateContainerName')]", "type": "String" },
+            "templateBlobName": { "defaultValue": "[parameters('templateBlobName')]", "type": "String" },
+            "reportStorageAccountName": { "defaultValue": "[parameters('reportStorageAccountName')]", "type": "String" },
+            "outputLanguage": { "defaultValue": "[parameters('outputLanguage')]", "type": "String" }
+          },
+          "triggers": {
+            "Recurrence": {
+              "type": "Recurrence",
+              "recurrence": {
+                "frequency": "[parameters('recurrenceFrequency')]",
+                "interval": "[parameters('recurrenceInterval')]",
+                "timeZone": "[parameters('recurrenceTimeZone')]",
+                "schedule": "[if(equals(parameters('recurrenceFrequency'), 'Month'), createObject('monthDays', createArray(parameters('recurrenceMonthDay')), 'hours', createArray(parameters('recurrenceHour')), 'minutes', createArray(parameters('recurrenceMinute'))), createObject('hours', createArray(parameters('recurrenceHour')), 'minutes', createArray(parameters('recurrenceMinute'))))]"
+              }
+            }
+          },
+          "actions": {
+            "KQL_usage_aggregate": {
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['azuremonitorlogs']['connectionId']" }
+                },
+                "method": "post",
+                "path": "/queryData",
+                "body": { "query": "[variables('usageQuery')]" },
+                "queries": {
+                  "subscriptions": "@parameters('sentinelSubscriptionId')",
+                  "resourcegroups": "@parameters('sentinelResourceGroupName')",
+                  "resourcetype": "Log Analytics Workspace",
+                  "resourcename": "@parameters('sentinelWorkspaceName')",
+                  "timerange": "Set in query"
+                }
+              },
+              "runAfter": {}
+            },
+            "Compose_rows": {
+              "type": "Compose",
+              "description": "KQL 結果から集計配列を取り出す",
+              "inputs": "@body('KQL_usage_aggregate')?['value']",
+              "runAfter": { "KQL_usage_aggregate": ["Succeeded"] }
+            },
+            "KQL_summary": {
+              "type": "ApiConnection",
+              "description": "① サマリ用の tier 別合計・前期比・件数を集計（決定論・数値ソース）",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['azuremonitorlogs']['connectionId']" }
+                },
+                "method": "post",
+                "path": "/queryData",
+                "body": { "query": "[variables('summaryQuery')]" },
+                "queries": {
+                  "subscriptions": "@parameters('sentinelSubscriptionId')",
+                  "resourcegroups": "@parameters('sentinelResourceGroupName')",
+                  "resourcetype": "Log Analytics Workspace",
+                  "resourcename": "@parameters('sentinelWorkspaceName')",
+                  "timerange": "Set in query"
+                }
+              },
+              "runAfter": { "KQL_usage_aggregate": ["Succeeded"] }
+            },
+            "Compose_summary": {
+              "type": "Compose",
+              "description": "サマリ1行を取り出す（0件時は空オブジェクト）",
+              "inputs": "@first(coalesce(body('KQL_summary')?['value'], json('[{}]')))",
+              "runAfter": { "KQL_summary": ["Succeeded"] }
+            },
+            "Compose_agent_prompt": {
+              "type": "Compose",
+              "description": "Build Agent への入力。集計 JSON をそのまま渡す。",
+              "inputs": "Use UsageCostReportInsightAgent to analyze the following Sentinel usage aggregation and produce ONLY the insight comments (surge / dead-table / tier). Do NOT recalculate any numbers; quote the provided values verbatim. Respond in @{parameters('outputLanguage')}.\n\naggregationJson:\n@{string(outputs('Compose_rows'))}",
+              "runAfter": { "Compose_rows": ["Succeeded"] }
+            },
+            "SecurityCopilot_insights": {
+              "type": "ApiConnection",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['securitycopilot']['connectionId']" }
+                },
+                "method": "post",
+                "path": "/process-prompt",
+                "body": { "PromptContent": "@outputs('Compose_agent_prompt')" }
+              },
+              "runAfter": { "Compose_agent_prompt": ["Succeeded"] }
+            },
+            "Normalize_agent_text": {
+              "type": "Compose",
+              "description": "Agent 応答からコードフェンス（```）と CR を除去し、ラベル抽出用に正規化。失敗時は空文字。",
+              "inputs": "@replace(replace(coalesce(body('SecurityCopilot_insights')?['EvaluationResultContent'], ''), '```', ''), decodeUriComponent('%0D'), '')",
+              "runAfter": { "SecurityCopilot_insights": ["Succeeded", "Failed", "TimedOut"] }
+            },
+            "Compose_safe_insights": {
+              "type": "Compose",
+              "description": "ラベル付きテキスト（STATUS/SURGE/DEAD/TIER/ERROR）から各示唆を耐障害的に抽出。ラベル欠落時はフォールバック文を充当（数値は影響なし）。",
+              "inputs": {
+                "status": "@{if(less(indexOf(outputs('Normalize_agent_text'),'STATUS:'),0), 'error', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'STATUS:'),7)), decodeUriComponent('%0A')))))}",
+                "surgeComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'SURGE:'),0), '示唆の自動生成に失敗しました。数値は下表（決定論集計）を参照してください。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'SURGE:'),6)), decodeUriComponent('%0A')))))}",
+                "deadTableComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'DEAD:'),0), '示唆の自動生成に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'DEAD:'),5)), decodeUriComponent('%0A')))))}",
+                "tierComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'TIER:'),0), '示唆の自動生成に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'TIER:'),5)), decodeUriComponent('%0A')))))}",
+                "errorMessage": "@{if(less(indexOf(outputs('Normalize_agent_text'),'ERROR:'),0), 'Security Copilot 応答の取得またはラベル抽出に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'ERROR:'),6)), decodeUriComponent('%0A')))))}"
+              },
+              "runAfter": { "Normalize_agent_text": ["Succeeded"] }
+            },
+            "Select_detail_rows": {
+              "type": "Select",
+              "description": "④ 明細テーブルの <tr> を決定論で生成（数値は KQL のまま）",
+              "inputs": {
+                "from": "@outputs('Compose_rows')",
+                "select": "@concat('<tr><td>', item()?['tableName'], '</td><td><span class=\"pill ', if(equals(item()?['tier'],'LakeOnly'),'pill-lake','pill-analytics'), '\">', item()?['tier'], '</span></td><td class=\"num\">', formatNumber(item()?['currentGB'],'0.000'), '</td><td class=\"num\">', formatNumber(item()?['previousGB'],'0.000'), '</td><td class=\"num\"><span class=\"', if(greaterOrEquals(item()?['deltaPercent'],0),'delta-up','delta-down'), '\">', if(greaterOrEquals(item()?['deltaPercent'],0),'+',''), string(item()?['deltaPercent']), '%</span></td><td>', coalesce(item()?['lastSeen'],'-'), '</td><td class=\"num\">', if(equals(parameters('showCost'),1), if(greater(parameters('usdToJpyRate'),0), concat('JPY ', formatNumber(mul(mul(item()?['currentGB'], float(if(equals(item()?['tier'],'LakeOnly'),parameters('priceLakeIngestPerGB'),parameters('priceAnalyticsIngestPerGB')))), parameters('usdToJpyRate')),'#,##0')), concat('USD ', string(mul(item()?['currentGB'], float(if(equals(item()?['tier'],'LakeOnly'),parameters('priceLakeIngestPerGB'),parameters('priceAnalyticsIngestPerGB'))))))), '—'), '</td></tr>')"
+              },
+              "runAfter": { "Compose_rows": ["Succeeded"] }
+            },
+            "Compose_maxgb": {
+              "type": "Compose",
+              "description": "棒グラフの幅基準（Top の currentGB）。0除算回避のため最小 0.001。",
+              "inputs": "@max(0.001, float(coalesce(first(outputs('Compose_rows'))?['currentGB'], 0.001)))",
+              "runAfter": { "Compose_rows": ["Succeeded"] }
+            },
+            "Select_chart_rows": {
+              "type": "Select",
+              "description": "② Top10 棒グラフ <div class=\"bar-row\"> を決定論で生成（幅は最大値比）",
+              "inputs": {
+                "from": "@take(outputs('Compose_rows'), 10)",
+                "select": "@concat('<div class=\"bar-row\"><div class=\"bar-name\" title=\"', item()?['tableName'], '\">', item()?['tableName'], '</div><div class=\"bar-track\"><div class=\"bar-fill\" style=\"width:', string(min(100, mul(div(float(item()?['currentGB']), outputs('Compose_maxgb')), 100))), '%;background:var(', if(equals(item()?['tier'],'LakeOnly'),'--lake','--analytics'), ')\"></div></div><div class=\"bar-val\">', formatNumber(item()?['currentGB'],'0.000'), '</div></div>')"
+              },
+              "runAfter": { "Compose_maxgb": ["Succeeded"] }
+            },
+            "Read_template": {
+              "type": "ApiConnection",
+              "description": "Blob からテンプレート HTML を読み込む（マネージド ID 認証）",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['azureblob']['connectionId']" }
+                },
+                "method": "get",
+                "path": "[concat('/v2/datasets/@{encodeURIComponent(parameters(''reportStorageAccountName''))}/files/@{encodeURIComponent(encodeURIComponent(concat(parameters(''templateContainerName''), ''/'', parameters(''templateBlobName''))))}/content')]",
+                "queries": { "inferContentType": true }
+              },
+              "runAfter": {}
+            },
+            "Compose_html": {
+              "type": "Compose",
+              "description": "テンプレートの {{TOKEN}} を replace 連鎖で実値に差し替え。数値=KQL（決定論）、示唆=耐障害版 Agent 出力。",
+              "inputs": "@replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(string(body('Read_template')), '{{WORKSPACE_NAME}}', parameters('sentinelWorkspaceName')), '{{RESOURCE_GROUP}}', parameters('sentinelResourceGroupName')), '{{REGION}}', parameters('sentinelRegionLabel')), '{{PERIOD_LABEL}}', concat('直近', string(parameters('lookbackDays')), '日（〜', formatDateTime(utcNow(),'yyyy-MM-dd'), '） vs 前', string(parameters('lookbackDays')), '日')), '{{GENERATED_AT}}', concat(formatDateTime(utcNow(),'yyyy-MM-dd HH:mm'), ' UTC')), '{{TOTAL_TABLES}}', string(coalesce(outputs('Compose_summary')?['totalTables'], 0))), '{{ANALYTICS_GB}}', string(coalesce(outputs('Compose_summary')?['analyticsGB'], 0))), '{{ANALYTICS_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['analyticsDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['analyticsPrevGB'],0)), ' GB）')), '{{ANALYTICS_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'delta-up','delta-down')), '{{LAKE_GB}}', string(coalesce(outputs('Compose_summary')?['lakeGB'], 0))), '{{LAKE_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['lakeDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['lakePrevGB'],0)), ' GB）')), '{{LAKE_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'delta-up','delta-down')), '{{COST_ANALYTICS}}', if(equals(parameters('showCost'),1), if(greater(parameters('usdToJpyRate'),0), concat('JPY ', formatNumber(mul(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))), parameters('usdToJpyRate')),'#,##0')), concat('USD ', formatNumber(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))),'#,##0'))), '— <small>単価未設定</small>')), '{{COST_NOTE}}', if(equals(parameters('showCost'),1), 'インジェスト単価ベースの推定', '単価未設定のため非表示')), '{{LAKEONLY_COUNT}}', string(coalesce(outputs('Compose_summary')?['lakeOnlyCount'], 0))), '{{TOPCHART_ROWS}}', join(body('Select_chart_rows'), '')), '{{SURGE_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['surgeComment'],'—')), '{{DEADTABLE_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['deadTableComment'],'—')), '{{TIER_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['tierComment'],'—')), '{{DETAIL_ROWS}}', join(body('Select_detail_rows'), '')), '{{COST_DISCLAIMER}}', if(equals(parameters('showCost'),1), 'コストはインジェスト系メーターの単価（Discount 後実単価）に基づく推定です。storage / query / advanced data insights は含みません。', 'コストは単価未設定のため非表示です。storage / query / advanced data insights は Usage に量が出ないため、Defender ポータル > Microsoft Sentinel > Cost management（Preview）を参照してください。'))",
+              "runAfter": {
+                "Read_template": ["Succeeded"],
+                "Select_detail_rows": ["Succeeded"],
+                "Select_chart_rows": ["Succeeded"],
+                "Compose_summary": ["Succeeded"],
+                "Compose_safe_insights": ["Succeeded"]
+              }
+            },
+            "Create_blob_report": {
+              "type": "ApiConnection",
+              "description": "生成 HTML を Blob に保存（ファイル名に生成日を付与、マネージド ID 認証）",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['azureblob']['connectionId']" }
+                },
+                "method": "post",
+                "path": "[concat('/v2/datasets/@{encodeURIComponent(parameters(''reportStorageAccountName''))}/files')]",
+                "queries": {
+                  "folderPath": "@parameters('reportContainerName')",
+                  "name": "@{concat('usage-report-', formatDateTime(utcNow(),'yyyy-MM-dd'), '.html')}",
+                  "queryParametersSingleEncoded": true
+                },
+                "body": "@outputs('Compose_html')"
+              },
+              "runAfter": { "Compose_html": ["Succeeded"] }
+            }
+          }
+        },
+        "parameters": {
+          "$connections": {
+            "value": {
+              "azuremonitorlogs": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('azuremonitorlogsConnectionName'))]",
+                "connectionName": "[variables('azuremonitorlogsConnectionName')]",
+                "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'azuremonitorlogs')]"
+              },
+              "securitycopilot": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('securitycopilotConnectionName'))]",
+                "connectionName": "[variables('securitycopilotConnectionName')]",
+                "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'securitycopilot')]"
+              },
+              "azureblob": {
+                "connectionId": "[resourceId('Microsoft.Web/connections', variables('azureblobConnectionName'))]",
+                "connectionName": "[variables('azureblobConnectionName')]",
+                "id": "[subscriptionResourceId('Microsoft.Web/locations/managedApis', parameters('location'), 'azureblob')]",
+                "connectionProperties": {
+                  "authentication": { "type": "ManagedServiceIdentity" }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Storage/storageAccounts/providers/roleAssignments",
+      "apiVersion": "2022-04-01",
+      "name": "[concat(parameters('reportStorageAccountName'), '/Microsoft.Authorization/', guid(resourceId('Microsoft.Storage/storageAccounts', parameters('reportStorageAccountName')), parameters('logicAppName'), variables('storageBlobDataContributorRoleId')))]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', parameters('reportStorageAccountName'))]",
+        "[resourceId('Microsoft.Logic/workflows', parameters('logicAppName'))]"
+      ],
+      "properties": {
+        "roleDefinitionId": "[subscriptionResourceId('Microsoft.Authorization/roleDefinitions', variables('storageBlobDataContributorRoleId'))]",
+        "principalId": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId]",
+        "principalType": "ServicePrincipal"
+      }
+    }
+  ],
+  "outputs": {
+    "logicAppResourceId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Logic/workflows', parameters('logicAppName'))]"
+    },
+    "logicAppPrincipalId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Logic/workflows', parameters('logicAppName')), '2019-05-01', 'full').identity.principalId]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "value": "[parameters('reportStorageAccountName')]"
+    }
+  }
+}

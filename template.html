@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<!--
+  Sentinel Usage / Cost Report テンプレート（完全静的・JS なし）
+  - Logic App / Function がプレースホルダ {{...}} を実値で置換して出力する。
+  - 外部 CDN / 外部 JS なし。ファイルを開くだけで完結（オフライン・監査アーカイブ向き）。
+
+  置換トークン一覧:
+    {{WORKSPACE_NAME}}      ワークスペース名
+    {{RESOURCE_GROUP}}      リソースグループ
+    {{REGION}}              リージョン
+    {{PERIOD_LABEL}}        対象期間ラベル（例: 直近30日（〜2026-06-04） vs 前30日）
+    {{GENERATED_AT}}        生成日時
+    {{TOTAL_TABLES}}        総テーブル数（ARM Tables API）
+    {{ANALYTICS_GB}}        Analytics tier 合計 GB
+    {{ANALYTICS_DELTA}}     Analytics 前期比（符号付き文字列。例: −22.1%（18.43 GB））
+    {{ANALYTICS_DELTA_CLASS}}  delta-up / delta-down
+    {{LAKE_GB}}             Data Lake Only 合計 GB
+    {{LAKE_DELTA}}          Lake 前期比
+    {{LAKE_DELTA_CLASS}}    delta-up / delta-down
+    {{COST_ANALYTICS}}      推定コスト（Analytics）。単価未設定時は「— <small>単価未設定</small>」
+    {{COST_NOTE}}           推定コスト補足
+    {{LAKEONLY_COUNT}}      Data Lake Only 候補テーブル数
+    {{TOPCHART_ROWS}}       ② Top N 棒グラフ行（生成側で <div class="bar-row"> を連結）
+    {{SURGE_COMMENT}}       ③ 使用量急増テーブル コメント（Agent 生成）
+    {{DEADTABLE_COMMENT}}   ③ 受信停止テーブル候補 コメント（Agent 生成）
+    {{TIER_COMMENT}}        ③ tier 変更示唆 コメント（Agent 生成）
+    {{DETAIL_ROWS}}         ④ 明細テーブル行（生成側で <tr> を連結）
+    {{COST_DISCLAIMER}}     ⑤ コスト免責文（単価設定有無で切替）
+-->
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sentinel 使用量レポート ({{WORKSPACE_NAME}})</title>
+<style>
+  :root{
+    --bg:#0f1419; --card:#1a2129; --ink:#e6edf3; --sub:#9aa7b4;
+    --line:#2b3540; --accent:#4493f8; --analytics:#4493f8; --lake:#d29922;
+    --up:#f85149; --down:#3fb950; --warn:#d29922;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    font-family:"Segoe UI","Yu Gothic UI",Meiryo,sans-serif;font-size:14px;line-height:1.6}
+  .wrap{max-width:1080px;margin:0 auto;padding:24px}
+  header{border-bottom:1px solid var(--line);padding-bottom:16px;margin-bottom:24px}
+  h1{font-size:22px;margin:0 0 4px}
+  .meta{color:var(--sub);font-size:13px}
+  h2{font-size:16px;margin:28px 0 12px;padding-left:10px;border-left:3px solid var(--accent)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px}
+  .card .label{color:var(--sub);font-size:12px}
+  .card .val{font-size:26px;font-weight:600;margin-top:4px}
+  .card .val small{font-size:14px;font-weight:400;color:var(--sub)}
+  .delta-up{color:var(--up)} .delta-down{color:var(--down)}
+  .pill{display:inline-block;font-size:11px;padding:1px 7px;border-radius:10px;font-weight:600}
+  .pill-analytics{background:rgba(68,147,248,.15);color:var(--analytics)}
+  .pill-lake{background:rgba(210,153,34,.15);color:var(--lake)}
+  table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px}
+  th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line)}
+  th{color:var(--sub);font-weight:600;font-size:12px}
+  td.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr:hover td{background:rgba(255,255,255,.02)}
+  .bar-row{display:flex;align-items:center;gap:10px;margin:6px 0}
+  .bar-name{width:230px;flex:0 0 230px;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .bar-track{flex:1;height:16px;background:rgba(255,255,255,.04);border-radius:3px;overflow:hidden}
+  .bar-fill{height:16px;border-radius:3px}
+  .bar-val{width:70px;flex:0 0 70px;text-align:right;font-variant-numeric:tabular-nums;font-size:12px}
+  .note{background:rgba(210,153,34,.08);border:1px solid rgba(210,153,34,.3);
+    border-radius:8px;padding:12px 16px;margin:10px 0;font-size:13px}
+  .note.info{background:rgba(68,147,248,.08);border-color:rgba(68,147,248,.3)}
+  .note b{color:var(--warn)}
+  ul.tight{margin:6px 0;padding-left:20px}
+  ul.tight li{margin:3px 0}
+  footer{margin-top:36px;padding-top:16px;border-top:1px solid var(--line);
+    color:var(--sub);font-size:12px}
+  code{background:#0b0f14;padding:1px 5px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Microsoft Sentinel 使用量・コスト レポート</h1>
+  <div class="meta">
+    ワークスペース: <b>{{WORKSPACE_NAME}}</b>（RG: {{RESOURCE_GROUP}} / {{REGION}}）　|　
+    対象期間: {{PERIOD_LABEL}}　|　
+    生成日時: {{GENERATED_AT}}　|　総テーブル数: {{TOTAL_TABLES}}
+  </div>
+</header>
+
+<!-- ① サマリ -->
+<h2>① サマリ</h2>
+<div class="cards">
+  <div class="card">
+    <div class="label">Analytics tier インジェスト</div>
+    <div class="val">{{ANALYTICS_GB}} <small>GB</small></div>
+    <div class="{{ANALYTICS_DELTA_CLASS}}">前期比 {{ANALYTICS_DELTA}}</div>
+  </div>
+  <div class="card">
+    <div class="label">Data Lake Only インジェスト</div>
+    <div class="val">{{LAKE_GB}} <small>GB</small></div>
+    <div class="{{LAKE_DELTA_CLASS}}">前期比 {{LAKE_DELTA}}</div>
+  </div>
+  <div class="card">
+    <div class="label">推定コスト（Analytics）</div>
+    <div class="val">{{COST_ANALYTICS}}</div>
+    <div class="meta">{{COST_NOTE}}</div>
+  </div>
+  <div class="card">
+    <div class="label">Data Lake Only 候補テーブル</div>
+    <div class="val">{{LAKEONLY_COUNT}} <small>件</small></div>
+    <div class="meta">plan = Auxiliary</div>
+  </div>
+</div>
+
+<div class="note info">
+  <b style="color:var(--accent)">ℹ 課金軸は2系統で分離表示しています。</b>
+  Analytics と Data Lake では課金メーターが別物のため合算していません。
+  本レポートで金額化できるのは <b style="color:var(--accent)">インジェスト系メーターのみ</b>です
+  （GB ソースが KQL Usage から取れるもの）。
+  <b style="color:var(--accent)">Data lake storage / query / advanced data insights</b> は使用量ソースが Usage に出ないため、
+  Defender ポータル &gt; Microsoft Sentinel &gt; Cost management（Preview）を参照してください。
+</div>
+
+<!-- ② Top テーブル -->
+<h2>② インジェスト量 Top テーブル（直近期間）</h2>
+<div id="topchart">
+{{TOPCHART_ROWS}}
+</div>
+
+<!-- ③ 注意・アクション（Security Copilot Build Agent 生成） -->
+<h2>③ 注意・アクション</h2>
+
+<div class="note">
+  <b>⚠ 使用量急増テーブル（前期比 大幅増 — 要因確認の対象）</b>
+  <p>{{SURGE_COMMENT}}</p>
+</div>
+
+<div class="note">
+  <b>⚠ 受信停止テーブル候補（30日以上データ未受信 — 連携停止または削除候補）</b>
+  <p>{{DEADTABLE_COMMENT}}</p>
+</div>
+
+<div class="note info">
+  <b style="color:var(--accent)">💡 tier 変更の検討余地</b>
+  <p>{{TIER_COMMENT}}</p>
+</div>
+
+<!-- ④ tier 別 明細 -->
+<h2>④ tier 別 テーブル明細（課金対象・直近期間 GB 降順）</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Table</th><th>Tier</th>
+      <th class="num">直近 (GB)</th><th class="num">前期 (GB)</th>
+      <th class="num">前期比</th><th>lastSeen</th><th class="num">推定コスト</th>
+    </tr>
+  </thead>
+  <tbody>
+{{DETAIL_ROWS}}
+  </tbody>
+</table>
+
+<!-- ⑤ メタ・免責 -->
+<footer>
+  <b>データソースと前提</b>
+  <ul class="tight">
+    <li>テーブル別 GB / lastSeen: Log Analytics <code>Usage</code> テーブル（課金対象 <code>IsBillable==true</code>、最大90日保持）。</li>
+    <li> 分析は Security Copilot Agent が生成しています（数値は再計算せず機械的な引用を利用しているので正確です）。</li>
+  </ul>
+  <b>免責</b>
+  <ul class="tight">
+    <li>{{COST_DISCLAIMER}}</li>
+     <li><code>Usage</code> は数時間のラグあり。当日分は未確定の可能性があります。</li>
+  </ul>
+</footer>
+
+</div>
+</body>
+</html>
