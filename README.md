@@ -173,3 +173,7 @@ Create_blob_report   usage-reports/usage-report-YYYY-MM-DD.html を保存
 ```
 
 テンプレ（[template.html](template.html)）を差し替えるだけでデザイン変更でき、Logic App の再デプロイは不要。
+
+## ライセンス
+
+ [MIT License](LICENSE)
