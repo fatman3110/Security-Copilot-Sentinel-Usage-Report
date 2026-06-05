@@ -20,12 +20,10 @@
     {{COST_ANALYTICS}}      推定コスト（Analytics）。単価未設定時は「— <small>単価未設定</small>」
     {{COST_NOTE}}           推定コスト補足
     {{LAKEONLY_COUNT}}      Data Lake Only 候補テーブル数
+    {{AGENT_INSIGHTS}}      Security Copilot による分析（Agent 出力をそのまま掲載、改行は <br>）
     {{TOPCHART_ROWS}}       ② Top N 棒グラフ行（生成側で <div class="bar-row"> を連結）
-    {{SURGE_COMMENT}}       ③ 使用量急増テーブル コメント（Agent 生成）
-    {{DEADTABLE_COMMENT}}   ③ 受信停止テーブル候補 コメント（Agent 生成）
-    {{TIER_COMMENT}}        ③ tier 変更示唆 コメント（Agent 生成）
-    {{DETAIL_ROWS}}         ④ 明細テーブル行（生成側で <tr> を連結）
-    {{COST_DISCLAIMER}}     ⑤ コスト免責文（単価設定有無で切替）
+    {{DETAIL_ROWS}}         ③ 明細テーブル行（生成側で <tr> を連結）
+    {{COST_DISCLAIMER}}     コスト免責文（単価設定有無で切替）
 -->
 <html lang="ja">
 <head>
@@ -88,6 +86,7 @@
   </div>
 </header>
 
+
 <!-- ① サマリ -->
 <h2>① サマリ</h2>
 <div class="cards">
@@ -117,9 +116,15 @@
   <b style="color:var(--accent)">ℹ 課金軸は2系統で分離表示しています。</b>
   Analytics と Data Lake では課金メーターが別物のため合算していません。
   本レポートで金額化できるのは <b style="color:var(--accent)">インジェスト系メーターのみ</b>です
-  （GB ソースが KQL Usage から取れるもの）。
+  （GB ソースが KQL Usage から取れるもの）。また、Data Lake デフォルトの System tables ワークスペース は本計算に含まれません。
   <b style="color:var(--accent)">Data lake storage / query / advanced data insights</b> は使用量ソースが Usage に出ないため、
   Defender ポータル &gt; Microsoft Sentinel &gt; Cost management を参照してください。
+</div>
+
+<!-- Security Copilot による分析（Build Agent 生成・整形せずそのまま掲載） -->
+<h2>Security Copilot による分析</h2>
+<div class="note info">
+  <p style="margin:0">{{AGENT_INSIGHTS}}</p>
 </div>
 
 <!-- ② Top テーブル -->
@@ -128,26 +133,8 @@
 {{TOPCHART_ROWS}}
 </div>
 
-<!-- ③ 注意・アクション（Security Copilot Build Agent 生成） -->
-<h2>③ 注意・アクション</h2>
-
-<div class="note">
-  <b>⚠ 使用量急増テーブル（前期比 大幅増 — 要因確認の対象）</b>
-  <p>{{SURGE_COMMENT}}</p>
-</div>
-
-<div class="note">
-  <b>⚠ 受信停止テーブル候補（30日以上データ未受信 — 連携停止または削除候補）</b>
-  <p>{{DEADTABLE_COMMENT}}</p>
-</div>
-
-<div class="note info">
-  <b style="color:var(--accent)">💡 tier 変更の検討余地</b>
-  <p>{{TIER_COMMENT}}</p>
-</div>
-
-<!-- ④ tier 別 明細 -->
-<h2>④ tier 別 テーブル明細（課金対象・直近期間 GB 降順）</h2>
+<!-- ③ tier 別 明細 -->
+<h2>③ tier 別 テーブル明細（課金対象・直近期間 GB 降順）</h2>
 <table>
   <thead>
     <tr>
@@ -161,7 +148,7 @@
   </tbody>
 </table>
 
-<!-- ⑤ メタ・免責 -->
+<!-- ④ メタ・免責 -->
 <footer>
   <b>データソースと前提</b>
   <ul class="tight">

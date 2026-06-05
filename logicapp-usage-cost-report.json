@@ -94,6 +94,16 @@
       "defaultValue": 30,
       "metadata": { "description": "直近期間の日数（前期比は直前の同日数と比較）" }
     },
+    "surgeThresholdPercent": {
+      "type": "int",
+      "defaultValue": 100,
+      "metadata": { "description": "オプション。使用量急増とみなす前期比のしきい値（%）。各テーブルの前期比がこの値以上なら『急増テーブル候補』として LLM 入力に含める。既定 100（=前期比 +100%／2 倍以上）。下げると小さな増加も拾い、上げると大きな急増のみに絞る。" }
+    },
+    "deadDays": {
+      "type": "int",
+      "defaultValue": 30,
+      "metadata": { "description": "オプション。受信停止テーブル候補とみなす最終受信からの経過日数。lastSeen がこの日数以上前なら『受信停止候補』として LLM 入力に含める。既定 30。Usage は最大 90 日保持のため 90 超は無効。" }
+    },
     "watchlistAlias": {
       "type": "string",
       "defaultValue": "TableTiers",
@@ -136,7 +146,8 @@
     "azureblobConnectionName": "azureblob",
     "storageBlobDataContributorRoleId": "ba92f5b4-2d11-453d-a403-e96b0029c9fe",
     "usageQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet usageRaw = Usage\n| where TimeGenerated > ago(look*2)\n| where IsBillable == true\n| extend period = iff(TimeGenerated > ago(look), \"cur\", \"prev\")\n| summarize GB = sum(Quantity)/1000 by DataType, period\n| evaluate pivot(period, sum(GB));\nlet seen = Usage | where TimeGenerated > ago(look*2) | summarize lastSeen = max(TimeGenerated) by DataType;\nusageRaw\n| join kind=leftouter seen on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| extend curGB = coalesce(cur, 0.0), prevGB = coalesce(prev, 0.0)\n| extend deltaPercent = iff(prevGB > 0, round((curGB - prevGB)/prevGB*100, 0), 9999.0)\n| project tableName = DataType, tier, currentGB = round(curGB, 3), previousGB = round(prevGB, 3), deltaPercent, lastSeen = format_datetime(lastSeen, \"yyyy-MM-dd\")\n| sort by currentGB desc')]",
-    "summaryQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet cur = Usage | where TimeGenerated > ago(look) | where IsBillable == true | summarize GB = sum(Quantity)/1000 by DataType;\nlet prev = Usage | where TimeGenerated between (ago(look*2) .. ago(look)) | where IsBillable == true | summarize pGB = sum(Quantity)/1000 by DataType;\ncur\n| join kind=leftouter prev on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| summarize analyticsGB = round(sumif(GB, tier == \"Analytics\"), 2), analyticsPrevGB = round(sumif(pGB, tier == \"Analytics\"), 2), lakeGB = round(sumif(GB, tier == \"LakeOnly\"), 3), lakePrevGB = round(sumif(pGB, tier == \"LakeOnly\"), 3), totalTables = dcount(DataType), lakeOnlyCount = dcountif(DataType, tier == \"LakeOnly\")\n| extend analyticsDelta = round(iff(analyticsPrevGB > 0, (analyticsGB - analyticsPrevGB)/analyticsPrevGB*100, 9999.0), 1), lakeDelta = round(iff(lakePrevGB > 0, (lakeGB - lakePrevGB)/lakePrevGB*100, 9999.0), 1)')]"
+    "summaryQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet cur = Usage | where TimeGenerated > ago(look) | where IsBillable == true | summarize GB = sum(Quantity)/1000 by DataType;\nlet prev = Usage | where TimeGenerated between (ago(look*2) .. ago(look)) | where IsBillable == true | summarize pGB = sum(Quantity)/1000 by DataType;\ncur\n| join kind=leftouter prev on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| summarize analyticsGB = round(sumif(GB, tier == \"Analytics\"), 2), analyticsPrevGB = round(sumif(pGB, tier == \"Analytics\"), 2), lakeGB = round(sumif(GB, tier == \"LakeOnly\"), 3), lakePrevGB = round(sumif(pGB, tier == \"LakeOnly\"), 3), totalTables = dcount(DataType), lakeOnlyCount = dcountif(DataType, tier == \"LakeOnly\")\n| extend analyticsDelta = round(iff(analyticsPrevGB > 0, (analyticsGB - analyticsPrevGB)/analyticsPrevGB*100, 9999.0), 1), lakeDelta = round(iff(lakePrevGB > 0, (lakeGB - lakePrevGB)/lakePrevGB*100, 9999.0), 1)')]",
+    "candidatesQuery": "[concat('let look = ', parameters('lookbackDays'), 'd;\nlet surgeTh = ', parameters('surgeThresholdPercent'), ';\nlet deadAgo = ', parameters('deadDays'), 'd;\nlet tiers = _GetWatchlist(\"', parameters('watchlistAlias'), '\") | project TableName = tostring(column_ifexists(\"TableName\", \"\")), WTier = tostring(column_ifexists(\"Tier\", \"DataLakeOnly\"));\nlet usageRaw = Usage\n| where TimeGenerated > ago(look*2)\n| where IsBillable == true\n| extend period = iff(TimeGenerated > ago(look), \"cur\", \"prev\")\n| summarize GB = sum(Quantity)/1000 by DataType, period\n| evaluate pivot(period, sum(GB));\nlet seen = Usage | where TimeGenerated > ago(look*2) | summarize lastSeen = max(TimeGenerated) by DataType;\nusageRaw\n| join kind=leftouter seen on DataType\n| join kind=leftouter tiers on $left.DataType == $right.TableName\n| extend tier = iff(isnotempty(WTier), \"LakeOnly\", \"Analytics\")\n| extend curGB = coalesce(cur, 0.0), prevGB = coalesce(prev, 0.0)\n| extend deltaPercent = iff(prevGB > 0, round((curGB - prevGB)/prevGB*100, 0), 9999.0)\n| extend isSurge = (deltaPercent >= surgeTh and prevGB > 0), isDead = (lastSeen < ago(deadAgo)), isTier = (tier == \"LakeOnly\")\n| where isSurge or isDead or isTier\n| extend reason = iff(isSurge, \"surge\", iff(isDead, \"dead\", \"tier\"))\n| extend prio = iff(isSurge, curGB*2, iff(isDead, curGB+1, curGB))\n| sort by prio desc\n| take 15\n| project tableName = DataType, tier, currentGB = round(curGB, 3), deltaPercent, lastSeen = format_datetime(lastSeen, \"yyyy-MM-dd\"), reason')]"
   },
   "resources": [
     {
@@ -315,11 +326,46 @@
               "inputs": "@first(coalesce(body('KQL_summary')?['value'], json('[{}]')))",
               "runAfter": { "KQL_summary": ["Succeeded"] }
             },
+            "KQL_candidates": {
+              "type": "ApiConnection",
+              "description": "注目テーブル（急増/受信停止/tier 候補）のみを KQL で事前抽出し LLM 入力を最小化（SCU 削減）。",
+              "inputs": {
+                "host": {
+                  "connection": { "name": "@parameters('$connections')['azuremonitorlogs']['connectionId']" }
+                },
+                "method": "post",
+                "path": "/queryData",
+                "body": { "query": "[variables('candidatesQuery')]" },
+                "queries": {
+                  "subscriptions": "@parameters('sentinelSubscriptionId')",
+                  "resourcegroups": "@parameters('sentinelResourceGroupName')",
+                  "resourcetype": "Log Analytics Workspace",
+                  "resourcename": "@parameters('sentinelWorkspaceName')",
+                  "timerange": "Set in query"
+                }
+              },
+              "runAfter": { "KQL_usage_aggregate": ["Succeeded"] }
+            },
+            "Compose_candidates": {
+              "type": "Compose",
+              "description": "候補配列を取り出す（0件時は空配列）。",
+              "inputs": "@coalesce(body('KQL_candidates')?['value'], json('[]'))",
+              "runAfter": { "KQL_candidates": ["Succeeded"] }
+            },
+            "Select_candidate_lines": {
+              "type": "Select",
+              "description": "候補を 1 行 1 テーブルのパイプ区切りテキストに圧縮（キー名反復を排除し入力トークンを削減）。",
+              "inputs": {
+                "from": "@outputs('Compose_candidates')",
+                "select": "@concat(item()?['tableName'], ' | ', item()?['tier'], ' | ', string(item()?['currentGB']), 'GB | ', string(item()?['deltaPercent']), '% | ', coalesce(item()?['lastSeen'],'-'), ' | ', item()?['reason'])"
+              },
+              "runAfter": { "Compose_candidates": ["Succeeded"] }
+            },
             "Compose_agent_prompt": {
               "type": "Compose",
-              "description": "Build Agent への入力。集計 JSON をそのまま渡す。",
-              "inputs": "Use UsageCostReportInsightAgent to analyze the following Sentinel usage aggregation and produce ONLY the insight comments (surge / dead-table / tier). Do NOT recalculate any numbers; quote the provided values verbatim. Respond in @{parameters('outputLanguage')}.\n\naggregationJson:\n@{string(outputs('Compose_rows'))}",
-              "runAfter": { "Compose_rows": ["Succeeded"] }
+              "description": "Build Agent への入力。全体集計（TOTALS）＋注目テーブルのみ（CANDIDATES）を渡し、全件 JSON は渡さない。",
+              "inputs": "Use UsageCostReportInsightAgent to analyze the following Sentinel usage data and produce the insight labels. Numbers are already computed deterministically; quote them verbatim and never recalculate. Respond in @{parameters('outputLanguage')}.\n\n[TOTALS]\nanalyticsGB=@{coalesce(outputs('Compose_summary')?['analyticsGB'],0)} analyticsDelta=@{coalesce(outputs('Compose_summary')?['analyticsDelta'],0)}% lakeGB=@{coalesce(outputs('Compose_summary')?['lakeGB'],0)} lakeDelta=@{coalesce(outputs('Compose_summary')?['lakeDelta'],0)}% totalTables=@{coalesce(outputs('Compose_summary')?['totalTables'],0)} lakeOnlyCount=@{coalesce(outputs('Compose_summary')?['lakeOnlyCount'],0)}\n\n[CANDIDATES] (columns: tableName | tier | currentGB | deltaPercent | lastSeen | reason)\n@{join(body('Select_candidate_lines'), decodeUriComponent('%0A'))}",
+              "runAfter": { "Compose_summary": ["Succeeded"], "Select_candidate_lines": ["Succeeded"] }
             },
             "SecurityCopilot_insights": {
               "type": "ApiConnection",
@@ -335,19 +381,15 @@
             },
             "Normalize_agent_text": {
               "type": "Compose",
-              "description": "Agent 応答からコードフェンス（```）と CR を除去し、ラベル抽出用に正規化。失敗時は空文字。",
-              "inputs": "@replace(replace(coalesce(body('SecurityCopilot_insights')?['EvaluationResultContent'], ''), '```', ''), decodeUriComponent('%0D'), '')",
+              "description": "Agent 応答を掘載用に整形。コードフェンス・CR を除去し、前後の空白をトリム。失敗時は空文字。",
+              "inputs": "@trim(replace(replace(coalesce(body('SecurityCopilot_insights')?['EvaluationResultContent'], ''), '```', ''), decodeUriComponent('%0D'), ''))",
               "runAfter": { "SecurityCopilot_insights": ["Succeeded", "Failed", "TimedOut"] }
             },
             "Compose_safe_insights": {
               "type": "Compose",
-              "description": "ラベル付きテキスト（STATUS/SURGE/DEAD/TIER/ERROR）から各示唆を耐障害的に抽出。ラベル欠落時はフォールバック文を充当（数値は影響なし）。",
+              "description": "Agent 出力をそのまま掲載用に整形（改行→<br>）。空応答時はフォールバック文。数値には影響しない。",
               "inputs": {
-                "status": "@{if(less(indexOf(outputs('Normalize_agent_text'),'STATUS:'),0), 'error', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'STATUS:'),7)), decodeUriComponent('%0A')))))}",
-                "surgeComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'SURGE:'),0), '示唆の自動生成に失敗しました。数値は下表（決定論集計）を参照してください。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'SURGE:'),6)), decodeUriComponent('%0A')))))}",
-                "deadTableComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'DEAD:'),0), '示唆の自動生成に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'DEAD:'),5)), decodeUriComponent('%0A')))))}",
-                "tierComment": "@{if(less(indexOf(outputs('Normalize_agent_text'),'TIER:'),0), '示唆の自動生成に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'TIER:'),5)), decodeUriComponent('%0A')))))}",
-                "errorMessage": "@{if(less(indexOf(outputs('Normalize_agent_text'),'ERROR:'),0), 'Security Copilot 応答の取得またはラベル抽出に失敗しました。', trim(first(split(substring(outputs('Normalize_agent_text'), add(indexOf(outputs('Normalize_agent_text'),'ERROR:'),6)), decodeUriComponent('%0A')))))}"
+                "insightHtml": "@{if(empty(outputs('Normalize_agent_text')), 'AI 分析の自動生成に失敗しました。数値は下記の決定論集計をご参照ください。', replace(outputs('Normalize_agent_text'), decodeUriComponent('%0A'), '<br>'))}"
               },
               "runAfter": { "Normalize_agent_text": ["Succeeded"] }
             },
@@ -391,7 +433,7 @@
             "Compose_html": {
               "type": "Compose",
               "description": "テンプレートの {{TOKEN}} を replace 連鎖で実値に差し替え。数値=KQL（決定論）、示唆=耐障害版 Agent 出力。",
-              "inputs": "@replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(string(body('Read_template')), '{{WORKSPACE_NAME}}', parameters('sentinelWorkspaceName')), '{{RESOURCE_GROUP}}', parameters('sentinelResourceGroupName')), '{{REGION}}', parameters('sentinelRegionLabel')), '{{PERIOD_LABEL}}', concat('直近', string(parameters('lookbackDays')), '日（〜', formatDateTime(utcNow(),'yyyy-MM-dd'), '） vs 前', string(parameters('lookbackDays')), '日')), '{{GENERATED_AT}}', concat(formatDateTime(utcNow(),'yyyy-MM-dd HH:mm'), ' UTC')), '{{TOTAL_TABLES}}', string(coalesce(outputs('Compose_summary')?['totalTables'], 0))), '{{ANALYTICS_GB}}', string(coalesce(outputs('Compose_summary')?['analyticsGB'], 0))), '{{ANALYTICS_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['analyticsDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['analyticsPrevGB'],0)), ' GB）')), '{{ANALYTICS_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'delta-up','delta-down')), '{{LAKE_GB}}', string(coalesce(outputs('Compose_summary')?['lakeGB'], 0))), '{{LAKE_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['lakeDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['lakePrevGB'],0)), ' GB）')), '{{LAKE_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'delta-up','delta-down')), '{{COST_ANALYTICS}}', if(equals(parameters('showCost'),1), if(greater(parameters('usdToJpyRate'),0), concat('JPY ', formatNumber(mul(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))), parameters('usdToJpyRate')),'#,##0')), concat('USD ', formatNumber(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))),'#,##0'))), '— <small>単価未設定</small>')), '{{COST_NOTE}}', if(equals(parameters('showCost'),1), 'インジェスト単価ベースの推定', '単価未設定のため非表示')), '{{LAKEONLY_COUNT}}', string(coalesce(outputs('Compose_summary')?['lakeOnlyCount'], 0))), '{{TOPCHART_ROWS}}', join(body('Select_chart_rows'), '')), '{{SURGE_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['surgeComment'],'—')), '{{DEADTABLE_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['deadTableComment'],'—')), '{{TIER_COMMENT}}', coalesce(outputs('Compose_safe_insights')?['tierComment'],'—')), '{{DETAIL_ROWS}}', join(body('Select_detail_rows'), '')), '{{COST_DISCLAIMER}}', if(equals(parameters('showCost'),1), 'コストはインジェスト系メーターの単価（Discount 後実単価）に基づく推定です。storage / query / advanced data insights は含みません。', 'コストは単価未設定のため非表示です。storage / query / advanced data insights は Usage に量が出ないため、Defender ポータル > Microsoft Sentinel > Cost management（Preview）を参照してください。'))",
+              "inputs": "@replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(replace(string(body('Read_template')), '{{AGENT_INSIGHTS}}', coalesce(outputs('Compose_safe_insights')?['insightHtml'],'—')), '{{WORKSPACE_NAME}}', parameters('sentinelWorkspaceName')), '{{RESOURCE_GROUP}}', parameters('sentinelResourceGroupName')), '{{REGION}}', parameters('sentinelRegionLabel')), '{{PERIOD_LABEL}}', concat('直近', string(parameters('lookbackDays')), '日（〜', formatDateTime(utcNow(),'yyyy-MM-dd'), '） vs 前', string(parameters('lookbackDays')), '日')), '{{GENERATED_AT}}', concat(formatDateTime(utcNow(),'yyyy-MM-dd HH:mm'), ' UTC')), '{{TOTAL_TABLES}}', string(coalesce(outputs('Compose_summary')?['totalTables'], 0))), '{{ANALYTICS_GB}}', string(coalesce(outputs('Compose_summary')?['analyticsGB'], 0))), '{{ANALYTICS_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['analyticsDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['analyticsPrevGB'],0)), ' GB）')), '{{ANALYTICS_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['analyticsDelta'],0),0),'delta-up','delta-down')), '{{LAKE_GB}}', string(coalesce(outputs('Compose_summary')?['lakeGB'], 0))), '{{LAKE_DELTA}}', concat(if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'+',''), string(coalesce(outputs('Compose_summary')?['lakeDelta'],0)), '%（', string(coalesce(outputs('Compose_summary')?['lakePrevGB'],0)), ' GB）')), '{{LAKE_DELTA_CLASS}}', if(greaterOrEquals(coalesce(outputs('Compose_summary')?['lakeDelta'],0),0),'delta-up','delta-down')), '{{COST_ANALYTICS}}', if(equals(parameters('showCost'),1), if(greater(parameters('usdToJpyRate'),0), concat('JPY ', formatNumber(mul(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))), parameters('usdToJpyRate')),'#,##0')), concat('USD ', formatNumber(mul(float(coalesce(outputs('Compose_summary')?['analyticsGB'],0)), float(parameters('priceAnalyticsIngestPerGB'))),'#,##0'))), '— <small>単価未設定</small>')), '{{COST_NOTE}}', if(equals(parameters('showCost'),1), 'インジェスト単価ベースの推定', '単価未設定のため非表示')), '{{LAKEONLY_COUNT}}', string(coalesce(outputs('Compose_summary')?['lakeOnlyCount'], 0))), '{{TOPCHART_ROWS}}', join(body('Select_chart_rows'), '')), '{{DETAIL_ROWS}}', join(body('Select_detail_rows'), '')), '{{COST_DISCLAIMER}}', if(equals(parameters('showCost'),1), 'コストはインジェスト系メーターの単価（Discount 後実単価）に基づく推定です。storage / query / advanced data insights は含みません。', 'コストは単価未設定のため非表示です。storage / query / advanced data insights は Usage に量が出ないため、Defender ポータル > Microsoft Sentinel > Cost management（Preview）を参照してください。'))",
               "runAfter": {
                 "Read_template": ["Succeeded"],
                 "Select_detail_rows": ["Succeeded"],
