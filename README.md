@@ -181,6 +181,9 @@ Create_blob_report   usage-reports/usage-report-YYYY-MM-DD.html を保存
 
 テンプレ（[template.html](template.html)）を差し替えるだけでデザイン変更でき、Logic App の再デプロイは不要。
 
+## 注意事項
+本ツールは公式 Microsoft 製品ではなく、Sentinel のコスト計算のために Security Copilot を利用するサンプルです。
+
 ## ライセンス
 
  [MIT License](LICENSE)
